@@ -233,6 +233,25 @@ This eval script drove a complete engineering cycle: measure → find a problem 
 2. **Caught a real bug** — the checkpoint accumulation issue described above — because the report showed an impossible number of categorizations for the fetched issue count
 3. **Surfaced non-determinism** as a measurable property, diagnosed it to the temperature setting, and **verified the fix with three repeated runs** producing identical results
 
+### Beyond accuracy: per-category precision, recall, F1
+
+A single accuracy number hides where a classifier is actually strong or weak — especially on an imbalanced test set like this one (6 Documentation vs. 3 Bug vs. 1 Feature Request). Breaking the same 10-issue result down per category:
+
+| Category | Precision | Recall | F1 |
+|---|---|---|---|
+| Documentation | 100% (5/5) | 100% (5/5) | 100% |
+| Bug | 75% (3/4) | 100% (3/3) | 85.7% |
+
+**Documentation: perfect** — every claim correct, every real Documentation issue found.
+
+**Bug: never misses a real bug (100% recall), but occasionally over-calls it** when the true label was Feature Request (one false positive, issue #7564, bringing precision to 75%). A "Bug" label from this agent is trustworthy for not missing anything, but worth a second glance before auto-escalating.
+
+```
+Precision (Bug) = TP / (TP + FP) = 3 / 4 = 75%
+Recall (Bug)    = TP / (TP + FN) = 3 / 3 = 100%
+F1 (Bug)        = 2 × (0.75 × 1.00) / (0.75 + 1.00) = 85.7%
+```
+
 ---
 
 
@@ -306,3 +325,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Building a labeled test set and an automated evaluation harness — replacing "it looks right" with a reproducible accuracy number
 - Evaluation isn't just for measuring quality — the eval harness directly caught a real correctness bug that casual manual testing had missed across several runs
 - LLM non-determinism is real and measurable — diagnosed via repeated eval runs showing different specific failures on the same test set, fixed by adding a separate temperature=0 client for the classification call, and verified with three consecutive identical eval runs
+- Per-category precision, recall, and F1 reveal failure modes that a single accuracy number hides — my Bug category has a false-positive problem (75% precision) but zero false negatives (100% recall), which is a specific, actionable finding versus a vague "90% accurate"
