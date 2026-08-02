@@ -6,8 +6,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 import requests
 import operator
 import json
+import uuid
+
 
 llm = ChatOllama(model="qwen2.5:7b")
+llm_deterministic = ChatOllama(model="qwen2.5:7b", temperature=0)  # for categorization
 
 
 class TriageState(TypedDict):
@@ -21,7 +24,7 @@ def fetch_issues(owner: str, repo: str, limit: int = 10) -> list:
     url = f"https://api.github.com/repos/{owner}/{repo}/issues"
     try:
         # fetch more than needed since PRs will be filtered out
-        response = requests.get(url, params={"state": "open", "per_page": limit * 4}, timeout=10)
+        response = requests.get(url, params={"state": "open", "per_page": limit * 10}, timeout=10)
         if response.status_code == 404:
             return []
         if response.status_code == 403:
@@ -42,7 +45,7 @@ def fetch_node(state: TriageState) -> dict:
         return {"issues": [], "triaged_issues": []}
     
     owner, repo_name = repo.split("/")
-    issues = fetch_issues(owner, repo_name, limit=5)
+    issues = fetch_issues(owner, repo_name, limit=10)
     print(f"\n  Fetched {len(issues)} issues from {state['repo']}")
     return {"issues": issues, "triaged_issues": []}
 
@@ -62,7 +65,7 @@ def triage_one_node(state: dict) -> dict:
     print(f"\n  [Triage] Issue #{number}: {title}")
 
     try:
-        category_response = llm.invoke(
+        category_response = llm_deterministic.invoke(
             f"Categorize this GitHub issue as exactly one of: Bug, Feature Request, "
             f"Documentation, Question, Other. Return ONLY the category word.\n\n"
             f"Title: {title}\nBody: {body[:500]}"
@@ -132,8 +135,8 @@ if __name__ == "__main__":
         app = graph.compile(checkpointer=checkpointer)
 
         repo = input("Enter a GitHub repo (owner/repo): ")
-        config = {"configurable": {"thread_id": f"triage-{repo.replace('/', '-')}"}}
-
+        # config = {"configurable": {"thread_id": f"triage-{repo.replace('/', '-')}"}}
+        config = {"configurable": {"thread_id": f"triage-{repo.replace('/', '-')}-{uuid.uuid4().hex[:8]}"}}
         result = app.invoke({
             "repo": repo,
             "issues": [],

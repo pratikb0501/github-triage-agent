@@ -1,6 +1,6 @@
 # GitHub Issue Triage Agent
 
-A multi-step agent that fetches open issues from any public GitHub repo, **categorizes each one, and drafts a suggested response** — using LangGraph's parallel fan-out/fan-in pattern with checkpointing for crash recovery.
+A multi-step agent that fetches open issues from any public GitHub repo, **categorizes each one, and drafts a suggested response** — using LangGraph's parallel fan-out/fan-in pattern with checkpointing for crash recovery, and validated with an automated evaluation harness (90% accuracy on a labeled test set).
 
 The agent never posts anything back to GitHub. It produces a report for a human to review — a deliberate **human-in-the-loop** design, not full automation.
 
@@ -120,18 +120,28 @@ triaged_issues: Annotated[List[Dict], operator.add]
 
 ---
 
-## Checkpointing — crash recovery
+## Checkpointing — crash recovery (and a real bug it exposed)
 
-State persists to `triage_checkpoints.db` after every node, using LangGraph's `SqliteSaver`. Each repo gets its own isolated save slot via a dynamically generated `thread_id`:
+State persists to `triage_checkpoints.db` after every node, using LangGraph's `SqliteSaver`. Each run gets an isolated save slot via a dynamically generated `thread_id`:
 
 ```python
-thread_id = f"triage-{repo.replace('/', '-')}"
-
-# "psf/requests"    → "triage-psf-requests"
-# "fastapi/fastapi" → "triage-fastapi-fastapi"
+run_id = uuid.uuid4().hex[:8]
+thread_id = f"triage-{repo.replace('/', '-')}-{run_id}"
 ```
 
-Different repos never collide in the checkpoint store — triaging one repo today and a different one tomorrow are completely isolated runs.
+### A bug that evaluation caught
+
+The first version keyed `thread_id` purely off the repo name (`f"triage-{repo}"`), with no per-run uniqueness. Since `triaged_issues` uses a reducer that only ever *appends* (`operator.add`), re-running the same repo reused the same checkpoint slot — each new run's results got appended on top of the previous run's, instead of starting fresh:
+
+```
+Run 1 on psf/requests: triaged_issues = [5 items]                    (saved)
+Run 2 on psf/requests: LOADS 5 saved items, ADDS 5 new = 10 items    (saved)
+Run 3 on psf/requests: LOADS 10 saved items, ADDS 5 new = 15 items   ← the bug
+```
+
+This surfaced while building the evaluation harness below — the report suddenly showed 15 categorizations for 5 fetched issues. **Building an eval script is what caught this**, not manual testing; running the agent casually a few times looked fine each time.
+
+The fix: generate a unique `run_id` per invocation, so every run starts from a clean checkpoint slot while still keeping crash-recovery within a single run. This is a good example of why evaluation matters beyond just measuring accuracy — it also catches real correctness bugs that "it looked fine when I tried it" misses entirely.
 
 ---
 
@@ -151,7 +161,81 @@ This is a deliberate scope decision, not a limitation — automating triage sugg
 
 ---
 
-## Tech stack
+## Evaluation — Project #3
+
+Rather than eyeballing outputs, this agent has an automated evaluation harness that measures categorization accuracy against a human-labeled test set.
+
+### How it works
+
+```mermaid
+flowchart TD
+    A[10 real GitHub issues] --> B[Human labels the<br/>correct category for each]
+    B --> C[Saved as test_set.json<br/>ground truth]
+    C --> D[eval.py runs each issue<br/>through the agent's triage logic]
+    D --> E[Compare agent's category<br/>to the ground truth]
+    E --> F[Accuracy score + per-issue report]
+
+    style B fill:#fff3cd,stroke:#b8860b
+    style D fill:#e8f4fd,stroke:#2e75b6
+    style F fill:#eafaf1,stroke:#1e8449
+```
+
+1. **Built a labeled test set** — 10 real issues from `psf/requests`, each manually assigned the correct category (Bug / Feature Request / Documentation / Question / Other), independent of and before seeing the agent's output
+2. **`eval.py`** runs the exact same `triage_one_node` function the live agent uses — no duplicated logic — against each test set item
+3. Compares the agent's category to the labeled ground truth and reports per-issue pass/fail plus an overall accuracy score
+
+### Result
+
+```
+$ python eval.py
+
+EVALUATION REPORT
+============================================================
+Accuracy: 9/10 (90.0%)
+
+✅ #7574: Support for HTTP Query Method
+   Expected: Feature Request  |  Actual: Feature Request
+❌ #7564: raise FileNotFoundError for missing TLS material
+   Expected: Feature Request  |  Actual: Bug
+✅ #7547: Documentation suggestion...
+   Expected: Documentation    |  Actual: Documentation
+...
+FINAL SCORE: 90.0%
+```
+
+### An honest finding: non-determinism (found, diagnosed, and fixed)
+
+Initial testing showed the eval score bouncing between runs on the *same* test set — not in overall accuracy (always ~90%), but in *which specific issue* failed. Issue #7574 and #7223 each flipped categories across different runs.
+
+**Diagnosis:** the categorization LLM call ran at Ollama's default temperature (not 0), so borderline issues could be classified differently each time.
+
+**Fix:** added a second, deterministic LLM client used only for categorization, while the response-drafting call keeps its default temperature (some wording variation there is harmless):
+
+```python
+llm = ChatOllama(model="qwen2.5:7b")                                # drafting
+llm_deterministic = ChatOllama(model="qwen2.5:7b", temperature=0)   # categorization
+```
+
+**Verified fix — three consecutive runs, identical results:**
+
+```
+Run 1: 9/10 (90.0%) — ❌ #7564 raise FileNotFoundError for missing TLS material
+Run 2: 9/10 (90.0%) — ❌ #7564 raise FileNotFoundError for missing TLS material
+Run 3: 9/10 (90.0%) — ❌ #7564 raise FileNotFoundError for missing TLS material
+```
+
+Identical accuracy and identical failure case across all three runs — categorization is now fully deterministic. The one remaining miss (#7564) is now a stable, reproducible disagreement rather than noise, which makes it worth actually investigating: the user proposes a specific code change (leaning Feature Request), but the agent may be pattern-matching on words like "error" and "missing" toward Bug. That's a legitimate prompt-refinement target for a future iteration — not something worth chasing before the fix, since it wasn't even the same failure twice.
+
+### Why this matters
+
+This eval script drove a complete engineering cycle: measure → find a problem → diagnose → fix → re-measure to confirm:
+1. Gave a **reproducible, quotable accuracy number** (90% on a 10-issue set) instead of a vague impression
+2. **Caught a real bug** — the checkpoint accumulation issue described above — because the report showed an impossible number of categorizations for the fetched issue count
+3. **Surfaced non-determinism** as a measurable property, diagnosed it to the temperature setting, and **verified the fix with three repeated runs** producing identical results
+
+---
+
+
 
 | Component | Choice |
 |-----------|--------|
@@ -174,11 +258,18 @@ python agent.py
 
 ## Usage
 
+Run the agent live:
 ```
+python agent.py
 Enter a GitHub repo (owner/repo): psf/requests
 ```
 
-Works on any public repo. Tested against `psf/requests` (146 open issues at time of testing, 5 fetched per run).
+Run the evaluation harness against the labeled test set:
+```
+python eval.py
+```
+
+Works on any public repo. Tested against `psf/requests` (146 open issues at time of testing, 5-10 fetched per run).
 
 ---
 
@@ -187,6 +278,8 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ```
 .
 ├── agent.py                  # the full triage agent
+├── eval.py                   # automated evaluation harness
+├── test_set.json             # human-labeled ground truth (10 issues)
 ├── triage_checkpoints.db     # SQLite checkpoint store (gitignored)
 └── README.md
 ```
@@ -199,7 +292,7 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 |---------|---------------------|
 | [Bare-metal Agent](https://github.com/pratikb0501/Bare-metal-ReAct-agent) | ReAct loop — variable steps, one question at a time |
 | [Planning Agent](https://github.com/pratikb0501/planning-agent) | Multi-step goal decomposition, checkpointing, parallel research |
-| **GitHub Triage Agent** (this repo) | Real external API integration, parallel triage at scale, human-in-the-loop design |
+| **GitHub Triage Agent** (this repo) | Real external API integration, parallel triage at scale, human-in-the-loop design, **evaluation harness with measured accuracy** |
 
 ---
 
@@ -209,4 +302,7 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Reusing the fan-out/fan-in parallel pattern for a genuinely useful, non-toy task
 - Designing human-in-the-loop as a first-class architectural decision, not an afterthought — the agent's read-only scope is deliberate
 - Defensive error handling at multiple layers: malformed input, API errors, and per-branch LLM failures that don't crash the whole batch
-- Checkpointing with dynamic, content-based thread IDs so multiple runs against different repos stay isolated
+- Checkpointing with per-run unique thread IDs, and specifically *why* naive repo-based thread IDs caused a silent data accumulation bug
+- Building a labeled test set and an automated evaluation harness — replacing "it looks right" with a reproducible accuracy number
+- Evaluation isn't just for measuring quality — the eval harness directly caught a real correctness bug that casual manual testing had missed across several runs
+- LLM non-determinism is real and measurable — diagnosed via repeated eval runs showing different specific failures on the same test set, fixed by adding a separate temperature=0 client for the classification call, and verified with three consecutive identical eval runs
