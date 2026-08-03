@@ -254,6 +254,65 @@ F1 (Bug)        = 2 × (0.75 × 1.00) / (0.75 + 1.00) = 85.7%
 
 ---
 
+### Evaluating the draft responses: LLM-as-judge
+
+Categorization has a clean ground truth to compare against. The **drafted responses** don't — there's no single "correct" wording, so precision/recall doesn't apply. Instead, `judge_eval.py` uses a second LLM call to score each draft on three criteria (professional, relevant, concise), 1-5 each.
+
+**Known limitation, stated honestly:** the judge uses the same model (`qwen2.5:7b`) that generated the responses, which carries documented self-preference bias risk — a model tends to rate its own outputs more favorably than an independent model would. Two mitigations are in place: the judge runs at `temperature=0` (same fix as categorization), and a **sanity check runs before every evaluation** to confirm the judge actually discriminates between quality levels rather than defaulting to a fixed score:
+
+```
+Judge sanity check
+  Bad response ("lol idk sounds like a you problem"):
+    professional: 2/5, relevant: 1/5, concise: 2/5
+  Good response ("Thank you for reporting... share your OS version"):
+    professional: 4/5, relevant: 3/5, concise: 2/5
+  ✅ Judge correctly scored the bad response lower — discriminates properly
+```
+
+This check matters: early testing showed "Professional" scoring exactly 4/5 across every single real response with zero variation, which looked suspicious — either the responses are genuinely that consistent, or the judge wasn't discriminating at all. Injecting a deliberately bad response resolved it: the judge dropped "professional" to 2/5 for the bad one, confirming the consistent 4/5 on real outputs reflects genuine, consistent quality rather than a lazy judge.
+
+**Results on the 10-issue test set** (professional / relevant / concise, each out of 5):
+
+| Metric | Typical range |
+|---|---|
+| Professional | 4/5 (consistent) |
+| Relevant | 3-5/5 |
+| Concise | 2-4/5 |
+
+"Concise" is the weakest and most variable dimension — several draft responses run longer than necessary, which is a legitimate target for prompt refinement (e.g. adding an explicit length constraint to the drafting prompt).
+
+---
+
+### Regression testing
+
+Every `eval.py` run saves its score to `eval_history.json` with a timestamp, then automatically compares against the previous run — catching the exact failure mode of "I changed something and forgot what the score used to be."
+
+```mermaid
+flowchart LR
+    A[Run eval.py] --> B[Calculate accuracy]
+    B --> C[Save to eval_history.json]
+    C --> D{Compare to<br/>previous entry}
+    D -->|lower| E[⚠️ REGRESSION DETECTED]
+    D -->|higher| F[✅ Improvement]
+    D -->|same| G[✅ Stable]
+
+    style E fill:#fde8e8,stroke:#c0392b
+    style F fill:#eafaf1,stroke:#1e8449
+    style G fill:#eafaf1,stroke:#1e8449
+```
+
+**Tested against both directions** — deliberately broke the categorization prompt (removed the "return only the category word" constraint), confirming the system catches degradation, then reverted it to confirm recovery is detected too:
+
+```
+Baseline:              90.0% → 90.0%  → ✅ No change — score is stable
+Deliberately broken:   90.0% → 0.0%   → ⚠️ REGRESSION DETECTED: dropped 90.0 points
+Reverted:               0.0% → 90.0%  → ✅ Improvement: increased 90.0 points
+```
+
+The broken-prompt test also revealed something beyond category accuracy: without the explicit "return only the category word" instruction, the model returned full explanatory sentences instead of a clean label — so the eval script is implicitly testing **output format compliance**, not just categorization correctness. A prompt change that breaks the expected output shape gets caught exactly as reliably as one that breaks the reasoning.
+
+---
+
 
 
 | Component | Choice |
@@ -297,8 +356,10 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ```
 .
 ├── agent.py                  # the full triage agent
-├── eval.py                   # automated evaluation harness
+├── eval.py                   # categorization accuracy harness + regression testing
+├── judge_eval.py             # LLM-as-judge for draft response quality
 ├── test_set.json             # human-labeled ground truth (10 issues)
+├── eval_history.json         # timestamped score history for regression detection
 ├── triage_checkpoints.db     # SQLite checkpoint store (gitignored)
 └── README.md
 ```
@@ -326,3 +387,6 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Evaluation isn't just for measuring quality — the eval harness directly caught a real correctness bug that casual manual testing had missed across several runs
 - LLM non-determinism is real and measurable — diagnosed via repeated eval runs showing different specific failures on the same test set, fixed by adding a separate temperature=0 client for the classification call, and verified with three consecutive identical eval runs
 - Per-category precision, recall, and F1 reveal failure modes that a single accuracy number hides — my Bug category has a false-positive problem (75% precision) but zero false negatives (100% recall), which is a specific, actionable finding versus a vague "90% accurate"
+- LLM-as-judge for evaluating open-ended output (draft responses) that has no single correct answer to compare against — and why it needs its own validation, not blind trust
+- Same-model judging carries self-preference bias risk; I mitigated this with temperature=0 and, more importantly, built a sanity check (deliberately bad vs. good response) that runs before every evaluation to confirm the judge actually discriminates rather than defaulting to a fixed score
+- Regression testing — persisting every eval score with a timestamp and automatically comparing against the previous run — turns "did my change help or hurt?" from a guess into an automatic, verified answer. Tested by deliberately breaking a prompt (90% → 0%, correctly flagged) and reverting it (0% → 90%, correctly flagged as improvement)
