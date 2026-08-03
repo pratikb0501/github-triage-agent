@@ -161,7 +161,7 @@ This is a deliberate scope decision, not a limitation — automating triage sugg
 
 ---
 
-## Evaluation — Project #3
+## Evaluation
 
 Rather than eyeballing outputs, this agent has an automated evaluation harness that measures categorization accuracy against a human-labeled test set.
 
