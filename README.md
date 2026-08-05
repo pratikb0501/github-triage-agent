@@ -242,6 +242,8 @@ A single accuracy number hides where a classifier is actually strong or weak —
 | Documentation | 100% (5/5) | 100% (5/5) | 100% |
 | Bug | 75% (3/4) | 100% (3/3) | 85.7% |
 
+![Bar chart comparing precision, recall, and F1 for Documentation and Bug categories — Documentation scores 100% on all three, Bug scores 75% precision, 100% recall, 85.7% F1](category_breakdown.png)
+
 **Documentation: perfect** — every claim correct, every real Documentation issue found.
 
 **Bug: never misses a real bug (100% recall), but occasionally over-calls it** when the true label was Feature Request (one false positive, issue #7564, bringing precision to 75%). A "Bug" label from this agent is trustworthy for not missing anything, but worth a second glance before auto-escalating.
@@ -309,6 +311,10 @@ Deliberately broken:   90.0% → 0.0%   → ⚠️ REGRESSION DETECTED: dropped 
 Reverted:               0.0% → 90.0%  → ✅ Improvement: increased 90.0 points
 ```
 
+`dashboard.py` renders this same history as a chart (`accuracy_trend.png`), generated directly from `eval_history.json`:
+
+![Accuracy trend across 5 eval runs, showing a stable 90% baseline, a deliberate drop to 0% from a broken prompt, and full recovery to 90% after reverting](accuracy_trend.png)
+
 The broken-prompt test also revealed something beyond category accuracy: without the explicit "return only the category word" instruction, the model returned full explanatory sentences instead of a clean label — so the eval script is implicitly testing **output format compliance**, not just categorization correctness. A prompt change that breaks the expected output shape gets caught exactly as reliably as one that breaks the reasoning.
 
 ---
@@ -347,6 +353,12 @@ Run the evaluation harness against the labeled test set:
 python eval.py
 ```
 
+Generate the accuracy trend chart from eval history:
+```
+pip install matplotlib
+python dashboard.py
+```
+
 Works on any public repo. Tested against `psf/requests` (146 open issues at time of testing, 5-10 fetched per run).
 
 ---
@@ -358,8 +370,11 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ├── agent.py                  # the full triage agent
 ├── eval.py                   # categorization accuracy harness + regression testing
 ├── judge_eval.py             # LLM-as-judge for draft response quality
+├── dashboard.py               # renders eval_history.json as a trend chart
 ├── test_set.json             # human-labeled ground truth (10 issues)
 ├── eval_history.json         # timestamped score history for regression detection
+├── accuracy_trend.png        # generated chart, committed so it renders in this README
+├── category_breakdown.png    # generated chart, committed so it renders in this README
 ├── triage_checkpoints.db     # SQLite checkpoint store (gitignored)
 └── README.md
 ```
@@ -390,3 +405,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - LLM-as-judge for evaluating open-ended output (draft responses) that has no single correct answer to compare against — and why it needs its own validation, not blind trust
 - Same-model judging carries self-preference bias risk; I mitigated this with temperature=0 and, more importantly, built a sanity check (deliberately bad vs. good response) that runs before every evaluation to confirm the judge actually discriminates rather than defaulting to a fixed score
 - Regression testing — persisting every eval score with a timestamp and automatically comparing against the previous run — turns "did my change help or hurt?" from a guess into an automatic, verified answer. Tested by deliberately breaking a prompt (90% → 0%, correctly flagged) and reverting it (0% → 90%, correctly flagged as improvement)
+- Turning eval history into a chart makes the same regression story readable at a glance — a single trend line communicates "tested, broken on purpose, recovered" faster than reading the raw log
