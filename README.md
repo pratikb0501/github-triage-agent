@@ -319,6 +319,41 @@ The broken-prompt test also revealed something beyond category accuracy: without
 
 ---
 
+### Experiment tracking with MLflow
+
+The JSON-based history above tracks *scores* but not the *configuration* that produced them — if the model, temperature, or prompt changes between runs, there's no record of which combination produced which result. MLflow logs both together.
+
+Every `eval.py` run logs to MLflow:
+
+```
+PARAMETERS (the configuration):
+  model = "qwen2.5:7b"
+  temperature = 0
+  test_set_size = 10
+
+METRICS (the results):
+  accuracy = 90.0
+  precision_bug, recall_bug, f1_bug
+  precision_documentation, recall_documentation, f1_documentation
+  precision_feature_request, recall_feature_request, f1_feature_request
+  (per-category metrics computed automatically for every category
+   present in the test set, not hand-typed)
+
+ARTIFACTS:
+  test_set.json (the exact ground truth used, for full reproducibility)
+```
+
+Unlike the hand-calculated Day 2 numbers, these per-category metrics are now computed by `calculate_category_metrics()` fresh on every run — including "Feature Request," a category the manual Day 2 pass didn't cover.
+
+Run locally:
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+This opens a queryable web UI where every run is a row — sortable and filterable by any parameter or metric, with side-by-side comparison between any two runs. That's the practical upgrade over static JSON + PNG: instead of re-reading a chart, you can ask "show me every run where temperature=0, sorted by Bug F1" directly in the UI.
+
+---
+
 
 
 | Component | Choice |
@@ -336,7 +371,7 @@ Runs **fully local and free**.
 
 ```bash
 ollama pull qwen2.5:7b
-pip install langgraph langchain-ollama requests langgraph-checkpoint-sqlite
+pip install langgraph langchain-ollama requests langgraph-checkpoint-sqlite mlflow matplotlib
 python agent.py
 ```
 
@@ -348,14 +383,18 @@ python agent.py
 Enter a GitHub repo (owner/repo): psf/requests
 ```
 
-Run the evaluation harness against the labeled test set:
+Run the evaluation harness against the labeled test set (also logs to MLflow):
 ```
 python eval.py
 ```
 
-Generate the accuracy trend chart from eval history:
+View tracked experiment runs:
 ```
-pip install matplotlib
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+Generate the accuracy trend and category breakdown charts from eval history:
+```
 python dashboard.py
 ```
 
@@ -368,13 +407,14 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ```
 .
 ├── agent.py                  # the full triage agent
-├── eval.py                   # categorization accuracy harness + regression testing
+├── eval.py                   # categorization accuracy harness + regression testing + MLflow logging
 ├── judge_eval.py             # LLM-as-judge for draft response quality
-├── dashboard.py               # renders eval_history.json as a trend chart
+├── dashboard.py               # renders eval_history.json as trend + category charts
 ├── test_set.json             # human-labeled ground truth (10 issues)
 ├── eval_history.json         # timestamped score history for regression detection
 ├── accuracy_trend.png        # generated chart, committed so it renders in this README
 ├── category_breakdown.png    # generated chart, committed so it renders in this README
+├── mlflow.db                 # MLflow SQLite tracking backend (gitignored)
 ├── triage_checkpoints.db     # SQLite checkpoint store (gitignored)
 └── README.md
 ```
@@ -406,3 +446,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Same-model judging carries self-preference bias risk; I mitigated this with temperature=0 and, more importantly, built a sanity check (deliberately bad vs. good response) that runs before every evaluation to confirm the judge actually discriminates rather than defaulting to a fixed score
 - Regression testing — persisting every eval score with a timestamp and automatically comparing against the previous run — turns "did my change help or hurt?" from a guess into an automatic, verified answer. Tested by deliberately breaking a prompt (90% → 0%, correctly flagged) and reverting it (0% → 90%, correctly flagged as improvement)
 - Turning eval history into a chart makes the same regression story readable at a glance — a single trend line communicates "tested, broken on purpose, recovered" faster than reading the raw log
+- MLflow closes the biggest gap in the hand-rolled tracking: JSON history recorded scores but never the configuration (model, temperature) that produced them. Logging both together, plus per-category metrics computed automatically instead of hand-typed, makes every historical result traceable and queryable through a real UI instead of re-reading static files

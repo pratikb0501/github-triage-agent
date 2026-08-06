@@ -1,9 +1,17 @@
 import json
 import datetime
 import os
+import mlflow
 from agent import fetch_issues, triage_one_node
+import sys
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+mlflow.set_tracking_uri("sqlite:///mlflow.db")
+mlflow.set_experiment("github-triage-categorization")
 
 HISTORY_FILE = "eval_history.json"
+
 
 def save_result_to_history(accuracy):
     history = []
@@ -21,6 +29,7 @@ def save_result_to_history(accuracy):
 
     return history
 
+
 def load_test_set(filepath="test_set.json"):
     with open(filepath, "r") as f:
         return json.load(f)
@@ -30,14 +39,12 @@ def run_evaluation(test_set):
     results = []
 
     for expected in test_set:
-        # build a minimal issue dict to pass into triage_one_node
         issue = {
             "number": expected["number"],
             "title": expected["title"],
             "body": expected.get("body", "")
         }
 
-        # run the SAME triage logic your agent uses
         output = triage_one_node({"issue": issue, "all_issues": []})
         actual_category = output["triaged_issues"][0]["category"]
 
@@ -54,6 +61,19 @@ def run_evaluation(test_set):
     return results
 
 
+def calculate_category_metrics(results, category):
+    """Precision/recall/F1 for one category, same manual method from Day 2."""
+    tp = sum(1 for r in results if r["actual"] == category and r["expected"] == category)
+    fp = sum(1 for r in results if r["actual"] == category and r["expected"] != category)
+    fn = sum(1 for r in results if r["actual"] != category and r["expected"] == category)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
+
+    return {"precision": precision * 100, "recall": recall * 100, "f1": f1 * 100}
+
+
 def print_report(results):
     correct = sum(1 for r in results if r["match"])
     total = len(results)
@@ -62,19 +82,44 @@ def print_report(results):
     history = save_result_to_history(accuracy)
     check_for_regression(history)
 
-    print(f"\n{'=' * 60}")
-    print(f"EVALUATION REPORT")
-    print(f"{'=' * 60}")
-    print(f"Accuracy: {correct}/{total} ({accuracy:.1f}%)\n")
+    # log this run to MLflow — parameters (config) + metrics (results) + artifacts (files)
+    with mlflow.start_run():
+        mlflow.log_param("model", "qwen2.5:7b")
+        mlflow.log_param("temperature", 0)
+        mlflow.log_param("test_set_size", total)
 
-    for r in results:
-        status = "✅" if r["match"] else "❌"
-        print(f"{status} #{r['number']}: {r['title'][:50]}")
-        print(f"   Expected: {r['expected']}  |  Actual: {r['actual']}")
+        mlflow.log_metric("accuracy", accuracy)
 
-    print(f"\n{'=' * 60}")
-    print(f"FINAL SCORE: {accuracy:.1f}%")
-    print(f"{'=' * 60}")
+        # per-category precision/recall/F1, logged automatically instead of hand-typed
+        categories = set(r["expected"] for r in results)
+        for category in categories:
+            metrics = calculate_category_metrics(results, category)
+            safe_name = category.lower().replace(" ", "_").replace("/", "_")
+            mlflow.log_metric(f"precision_{safe_name}", metrics["precision"])
+            mlflow.log_metric(f"recall_{safe_name}", metrics["recall"])
+            mlflow.log_metric(f"f1_{safe_name}", metrics["f1"])
+
+        mlflow.log_artifact("test_set.json")
+
+        print(f"\n{'=' * 60}")
+        print(f"EVALUATION REPORT")
+        print(f"{'=' * 60}")
+        print(f"Accuracy: {correct}/{total} ({accuracy:.1f}%)\n")
+
+        for r in results:
+            status = "✅" if r["match"] else "❌"
+            print(f"{status} #{r['number']}: {r['title'][:50]}")
+            print(f"   Expected: {r['expected']}  |  Actual: {r['actual']}")
+
+        print(f"\n{'=' * 60}")
+        print(f"FINAL SCORE: {accuracy:.1f}%")
+        print(f"{'=' * 60}")
+
+        print("\nPer-category breakdown (also logged to MLflow):")
+        for category in categories:
+            m = calculate_category_metrics(results, category)
+            print(f"  {category}: precision={m['precision']:.1f}%  recall={m['recall']:.1f}%  f1={m['f1']:.1f}%")
+
 
 def check_for_regression(history):
     if len(history) < 2:
@@ -92,6 +137,7 @@ def check_for_regression(history):
         print(f"✅ Improvement: score increased by {current - previous:.1f} points")
     else:
         print("✅ No change — score is stable")
+
 
 if __name__ == "__main__":
     test_set = load_test_set()
