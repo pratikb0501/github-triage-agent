@@ -6,6 +6,28 @@ The agent never posts anything back to GitHub. It produces a report for a human 
 
 ---
 
+## Contents
+
+- [What it does](#what-it-does)
+- [The graph](#the-graph)
+- [How each node works](#how-each-node-works)
+- [Parallel execution](#parallel-execution)
+- [Checkpointing — crash recovery](#checkpointing-crash-recovery-and-a-real-bug-it-exposed)
+- [Human-in-the-loop by design](#human-in-the-loop-by-design)
+- [Guardrails](#guardrails)
+- [Evaluation](#evaluation)
+  - Per-category precision, recall, F1
+  - LLM-as-judge with self-preference bias mitigation
+  - Regression testing
+  - Experiment tracking with MLflow
+- [Setup](#setup)
+- [Usage](#usage)
+- [Project structure](#project-structure)
+- [The progression](#the-progression)
+- [What I learned](#what-i-learned)
+
+---
+
 ## What it does
 
 Give it any public repo. It fetches open issues, triages each one in parallel, and produces a structured report:
@@ -158,6 +180,61 @@ This agent deliberately **only reads** from GitHub (GET requests) — it never c
 ```
 
 This is a deliberate scope decision, not a limitation — automating triage suggestions is valuable; automating actual repo changes without human review is a different (and riskier) product.
+
+---
+
+## Guardrails
+
+Input and output validation sit as a layer around every LLM call — not scattered ad-hoc checks, but consistent validation before the model sees data and before its response is trusted downstream.
+
+```mermaid
+flowchart TD
+    A[Issue fetched from GitHub] --> B{Input guardrail}
+    B -->|title empty or body too long| C[Reject — fallback response,<br/>no LLM call made]
+    B -->|valid| D[LLM categorizes]
+    D --> E{Output guardrail}
+    E -->|not in allowed 5 categories,<br/>or refusal language detected| F[Fall back to 'Other',<br/>flag for review]
+    E -->|valid| G[Category used in report]
+
+    style B fill:#fff3cd,stroke:#b8860b
+    style E fill:#fff3cd,stroke:#b8860b
+    style C fill:#fde8e8,stroke:#c0392b
+    style F fill:#fde8e8,stroke:#c0392b
+    style D fill:#e8f4fd,stroke:#2e75b6
+    style G fill:#eafaf1,stroke:#1e8449
+```
+
+### Input guardrail — caught a real case on live data
+
+Checks title presence and body length (max 5,000 characters) before any LLM call is made. Running against `psf/requests`, this fired naturally — not in a staged test:
+
+```
+[Guardrail] Issue #7357 rejected: Issue body exceeds 5000 characters (6067)
+```
+
+Issue #7357 ("Localization of The Requests Documentation") has an unusually long body. The guardrail rejected it before spending a token, returning a clear fallback instead of sending an oversized payload to the model.
+
+### Output guardrail — closes a gap evaluation exposed reactively
+
+Validates that the returned category is exactly one of the five allowed values, and screens for refusal language. This directly targets the failure mode discovered during [Week 9's regression testing](#regression-testing): a broken prompt once caused the model to return full explanatory sentences instead of a clean category label, silently corrupting the eval score.
+
+```python
+validate_category_output(
+    "Based on the title, I would categorize this as a Bug since it indicates an error."
+)
+# → valid=False, category="Other"
+```
+
+The same failure mode is now caught at the point of generation, automatically, rather than requiring an eval run to notice the score had crashed:
+
+```
+BEFORE guardrails: broken prompt → free-text output → eval score silently drops to 0%
+                   → discovered only by re-running eval.py and noticing the drop
+
+AFTER guardrails:  broken prompt → free-text output →
+                   [Guardrail] Invalid category output → falls back to 'Other'
+                   → caught in real time, doesn't propagate downstream
+```
 
 ---
 
@@ -447,3 +524,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Regression testing — persisting every eval score with a timestamp and automatically comparing against the previous run — turns "did my change help or hurt?" from a guess into an automatic, verified answer. Tested by deliberately breaking a prompt (90% → 0%, correctly flagged) and reverting it (0% → 90%, correctly flagged as improvement)
 - Turning eval history into a chart makes the same regression story readable at a glance — a single trend line communicates "tested, broken on purpose, recovered" faster than reading the raw log
 - MLflow closes the biggest gap in the hand-rolled tracking: JSON history recorded scores but never the configuration (model, temperature) that produced them. Logging both together, plus per-category metrics computed automatically instead of hand-typed, makes every historical result traceable and queryable through a real UI instead of re-reading static files
+- Guardrails as a consistent layer (validate before the LLM call, validate after) rather than scattered checks — the input guardrail caught a real oversized issue on live data, and the output guardrail closes, proactively, the exact failure mode Week 9's regression testing had only caught reactively after the score already crashed
