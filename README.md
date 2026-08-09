@@ -16,6 +16,7 @@ The agent never posts anything back to GitHub. It produces a report for a human 
 - [Human-in-the-loop by design](#human-in-the-loop-by-design)
 - [Guardrails](#guardrails)
 - [Prompt injection resistance](#prompt-injection-resistance)
+- [Cost & latency optimization](#cost--latency-optimization)
 - [Evaluation](#evaluation)
   - Per-category precision, recall, F1
   - LLM-as-judge with self-preference bias mitigation
@@ -297,6 +298,60 @@ Layer 3 — human-in-the-loop: the draft RESPONSE has no structural guardrail,
 
 The one output type without a structural guardrail (free-text responses) is also the one type that's never auto-executed — the read-only, human-in-the-loop design covers exactly the gap the prompt-level defense leaves open.
 
+`test_injection.py` runs this exact test standalone — rerun it any time the categorization or drafting prompts change, to confirm the mitigations still hold:
+
+```bash
+python test_injection.py
+```
+
+---
+
+## Cost & latency optimization
+
+The agent originally made two LLM calls per issue — one to categorize, one to draft a response. The single biggest lever for reducing both cost and latency is reducing the number of calls per unit of work, so both were combined into **one structured-output call** using Pydantic:
+
+```python
+class TriageResult(BaseModel):
+    category: str
+    draft_response: str
+
+response = llm_deterministic.with_structured_output(TriageResult).invoke(prompt)
+```
+
+```
+BEFORE: 2 LLM calls per issue → 10 issues = 20 calls
+AFTER:  1 LLM call per issue  → 10 issues = 10 calls
+
+50% fewer LLM calls, same architecture otherwise.
+```
+
+All guardrails and the delimiter-based injection mitigation from earlier sections carry over unchanged — combining the calls doesn't remove any safety layer, it just changes how many round-trips it takes to get there.
+
+### Verified with the existing eval harness — no quality regression
+
+Rather than assume the optimization was safe, it was measured against the same 10-issue test set used throughout this project:
+
+```
+BEFORE optimization: 90.0% accuracy, failure on #7564
+AFTER optimization:  90.0% accuracy, failure on #7564 (identical)
+
+Per-category breakdown unchanged:
+  Documentation:   100% / 100% / 100% (precision/recall/F1)
+  Bug:              75% / 100% / 85.7%
+  Feature Request: 100% /  50% / 66.7%
+```
+
+Identical accuracy, identical failure case, identical per-category metrics — the optimization achieved a real 50% reduction in LLM calls with zero measurable quality cost. This is the direct payoff of having regression testing already in place from Week 9: the change could be verified with confidence instead of assumed safe.
+
+### Other optimizations considered but not yet implemented
+
+| Optimization | Effect | Status |
+|---|---|---|
+| Model routing (smaller model for categorization) | Further cost reduction | Not implemented — single local model available |
+| Result caching | Skips redundant calls on repeated inputs | Not implemented |
+| Batch API processing | ~50% cost discount, acceptable since triage is reviewed later, not real-time | Not applicable — no paid API in use |
+| Parallel execution | Reduces latency, not cost | Already implemented (Week 7) — proven to depend on infrastructure supporting true concurrency, not just code structure |
+
 ---
 
 ## Evaluation
@@ -521,6 +576,11 @@ python agent.py
 Enter a GitHub repo (owner/repo): psf/requests
 ```
 
+Run the prompt injection regression test:
+```
+python test_injection.py
+```
+
 Run the evaluation harness against the labeled test set (also logs to MLflow):
 ```
 python eval.py
@@ -545,6 +605,7 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ```
 .
 ├── agent.py                  # the full triage agent
+├── test_injection.py         # standalone prompt injection regression test
 ├── eval.py                   # categorization accuracy harness + regression testing + MLflow logging
 ├── judge_eval.py             # LLM-as-judge for draft response quality
 ├── dashboard.py               # renders eval_history.json as trend + category charts
@@ -587,3 +648,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - MLflow closes the biggest gap in the hand-rolled tracking: JSON history recorded scores but never the configuration (model, temperature) that produced them. Logging both together, plus per-category metrics computed automatically instead of hand-typed, makes every historical result traceable and queryable through a real UI instead of re-reading static files
 - Guardrails as a consistent layer (validate before the LLM call, validate after) rather than scattered checks — the input guardrail caught a real oversized issue on live data, and the output guardrail closes, proactively, the exact failure mode Week 9's regression testing had only caught reactively after the score already crashed
 - Prompt injection has no structural fix equivalent to SQL injection's parameterized queries — delimiters help but don't guarantee safety. Testing a real injection attempt showed structured output (category) fully resisted via the output guardrail, while free-text output (draft response) partially leaked, confirming that structured fields are inherently easier to defend than free text, and that the agent's read-only, human-in-the-loop design covers exactly that remaining gap
+- Reducing LLM calls per unit of work is the single biggest lever for cutting both cost and latency together — combining categorization and drafting into one structured-output call cut LLM calls in half. More importantly, having the Week 9 eval harness already in place meant this optimization could be *verified* safe (identical 90% accuracy, identical failure case, identical per-category metrics) instead of shipped on faith
