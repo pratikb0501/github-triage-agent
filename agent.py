@@ -1,12 +1,14 @@
+import operator
+import json
+import uuid
+import requests
 from typing import TypedDict, List, Dict, Annotated
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite import SqliteSaver
-import requests
-import operator
-import json
-import uuid
+from dotenv import load_dotenv
+load_dotenv()
 
 MAX_BODY_LENGTH = 5000  # characters — protects against token cost blowup
 ALLOWED_CATEGORIES = {"Bug", "Feature Request", "Documentation", "Question", "Other"}

@@ -17,6 +17,7 @@ The agent never posts anything back to GitHub. It produces a report for a human 
 - [Guardrails](#guardrails)
 - [Prompt injection resistance](#prompt-injection-resistance)
 - [Cost & latency optimization](#cost--latency-optimization)
+- [Observability — tracing with LangSmith](#observability--tracing-with-langsmith)
 - [Evaluation](#evaluation)
   - Per-category precision, recall, F1
   - LLM-as-judge with self-preference bias mitigation
@@ -354,6 +355,44 @@ Identical accuracy, identical failure case, identical per-category metrics — t
 
 ---
 
+## Observability — tracing with LangSmith
+
+Print statements work for watching a run live, but they don't scale to debugging a run that happened yesterday, or answering "which of the 10 parallel triage calls actually caused this wrong category?" LangSmith gives structured, queryable tracing with almost no code change, since LangGraph auto-instruments when its environment variables are set:
+
+```
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=...
+LANGCHAIN_PROJECT=github-triage-agent
+```
+
+(Kept in `.env`, gitignored — the same principle from [Prompt injection resistance](#prompt-injection-resistance) about never putting secrets in code or the LLM's context.)
+
+### What a real trace shows
+
+Every run produces a full execution tree — not just the top-level input/output, but every node and every LLM call inside it:
+
+```
+LangGraph (top-level run)
+  ├── fetch                            1.55s
+  ├── route_to_triage                  0.01s
+  ├── triage_one (issue #7599)         109.21s, 312 tokens
+  ├── triage_one (issue #7574)         124.33s, 305 tokens
+  │     ├── qwen2.5:7b                 124.22s   ← the actual model call
+  │     └── PydanticOutputParser       0.01s     ← parsing the structured output
+  ├── triage_one (issue #7564)          96.37s, 286 tokens
+  │     ├── qwen2.5:7b                  96.31s
+  │     └── PydanticOutputParser        0.00s
+  ... (remaining triage_one calls)
+```
+
+Clicking into any individual `triage_one` or `qwen2.5:7b` entry shows the **exact prompt sent and exact response received** for that specific call — the same debugging chain described in the observability theory: locate the node → inspect the exact prompt → check whether a guardrail fired → check success/failure, without needing to reproduce the run live.
+
+### A real finding this surfaced
+
+The per-call latencies (96–124 seconds per issue) are visible directly in the trace tree, broken down by sub-step. The `PydanticOutputParser` step consistently completes in under 0.01s across every call — confirming the latency is entirely in LLM generation time, not in parsing the structured output from Day 3's optimization. This is the kind of granular, per-step timing breakdown that print statements never provided.
+
+---
+
 ## Evaluation
 
 Rather than eyeballing outputs, this agent has an automated evaluation harness that measures categorization accuracy against a human-labeled test set.
@@ -564,9 +603,19 @@ Runs **fully local and free**.
 
 ```bash
 ollama pull qwen2.5:7b
-pip install langgraph langchain-ollama requests langgraph-checkpoint-sqlite mlflow matplotlib
+pip install langgraph langchain-ollama requests langgraph-checkpoint-sqlite mlflow matplotlib python-dotenv
 python agent.py
 ```
+
+**Optional — enable LangSmith tracing:** create a free account at [smith.langchain.com](https://smith.langchain.com), then add a `.env` file (gitignored):
+
+```
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your-api-key
+LANGCHAIN_PROJECT=github-triage-agent
+```
+
+No other code change is needed — LangGraph auto-instruments every node and LLM call when these are set.
 
 ## Usage
 
@@ -649,3 +698,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Guardrails as a consistent layer (validate before the LLM call, validate after) rather than scattered checks — the input guardrail caught a real oversized issue on live data, and the output guardrail closes, proactively, the exact failure mode Week 9's regression testing had only caught reactively after the score already crashed
 - Prompt injection has no structural fix equivalent to SQL injection's parameterized queries — delimiters help but don't guarantee safety. Testing a real injection attempt showed structured output (category) fully resisted via the output guardrail, while free-text output (draft response) partially leaked, confirming that structured fields are inherently easier to defend than free text, and that the agent's read-only, human-in-the-loop design covers exactly that remaining gap
 - Reducing LLM calls per unit of work is the single biggest lever for cutting both cost and latency together — combining categorization and drafting into one structured-output call cut LLM calls in half. More importantly, having the Week 9 eval harness already in place meant this optimization could be *verified* safe (identical 90% accuracy, identical failure case, identical per-category metrics) instead of shipped on faith
+- LangGraph's tracing integrates with LangSmith through environment variables alone — no explicit tracing code needed for automatic instrumentation of every node and LLM call. The resulting trace tree exposed real per-step latency data (confirming structured-output parsing takes under 0.01s, so all latency is LLM generation time) that print statements never could have shown
