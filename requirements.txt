@@ -1,0 +1,9 @@
+langgraph
+langgraph-checkpoint-sqlite
+langchain-ollama
+requests
+mlflow
+matplotlib
+numpy
+python-dotenv
+langsmith

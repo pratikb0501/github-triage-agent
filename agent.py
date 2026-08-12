@@ -8,16 +8,23 @@ from langgraph.types import Send
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite import SqliteSaver
 from dotenv import load_dotenv
+from pydantic import BaseModel
 load_dotenv()
+import os
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 MAX_BODY_LENGTH = 5000  # characters — protects against token cost blowup
 ALLOWED_CATEGORIES = {"Bug", "Feature Request", "Documentation", "Question", "Other"}
 REFUSAL_PATTERNS = ["i cannot", "i can't", "i'm unable", "as an ai", "i apologize"]
 
-llm = ChatOllama(model="qwen2.5:7b")
-llm_deterministic = ChatOllama(model="qwen2.5:7b", temperature=0)  # for categorization
 
-from pydantic import BaseModel
+# llm = ChatOllama(model="qwen2.5:7b")
+# llm_deterministic = ChatOllama(model="qwen2.5:7b", temperature=0)  # for categorization
+
+llm = ChatOllama(model="qwen2.5:7b", base_url=OLLAMA_BASE_URL)
+llm_deterministic = ChatOllama(model="qwen2.5:7b", temperature=0, base_url=OLLAMA_BASE_URL)
+
 
 class TriageResult(BaseModel):
     category: str

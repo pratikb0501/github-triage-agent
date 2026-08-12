@@ -18,6 +18,7 @@ The agent never posts anything back to GitHub. It produces a report for a human 
 - [Prompt injection resistance](#prompt-injection-resistance)
 - [Cost & latency optimization](#cost--latency-optimization)
 - [Observability — tracing with LangSmith](#observability--tracing-with-langsmith)
+- [Deployment — Docker](#deployment--docker)
 - [Evaluation](#evaluation)
   - Per-category precision, recall, F1
   - LLM-as-judge with self-preference bias mitigation
@@ -393,6 +394,68 @@ The per-call latencies (96–124 seconds per issue) are visible directly in the 
 
 ---
 
+## Deployment — Docker
+
+The agent runs in a container, reaching a native Ollama installation on the host machine rather than containerizing Ollama itself — a deliberate choice after the Ollama image proved unreliable to pull (see below).
+
+```dockerfile
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && update-ca-certificates
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "-u", "agent.py"]
+```
+
+```yaml
+# docker-compose.yml
+services:
+  triage-agent:
+    build: .
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stdin_open: true
+    tty: true
+```
+
+Run it:
+```bash
+docker-compose run triage-agent
+```
+
+### Why `docker-compose run` instead of `docker-compose up`
+
+`up` is designed for long-running services and doesn't reliably attach an interactive terminal in this setup, even with `stdin_open`/`tty` set. `run` is built for one-off interactive commands and correctly surfaces the agent's `input()` prompt. The agent is a one-shot interactive script — closer to what `run` is designed for than a persistent background service.
+
+### Real production issues hit and fixed, in order
+
+Containerizing this agent surfaced six genuine deployment problems — each one a common, real issue rather than something specific to a toy setup:
+
+| Problem | Symptom | Fix |
+|---|---|---|
+| Pulling `ollama/ollama` failed repeatedly | `httpReadSeeker: failed open ... EOF` on every attempt, different image layers each time | Decided not to containerize Ollama at all — connect the container to the host's already-running native Ollama instead |
+| Same failure on `python:3.13-slim`, a much smaller image | Identical error on an unrelated, small image — ruled out image size as the cause | Diagnosed as a WSL2 networking glitch; fixed with `wsl --shutdown` + full Docker Desktop restart |
+| Container ran but produced no visible output | `docker logs` showed nothing at all, despite `docker ps` confirming the container was up | Python buffers stdout by default when not attached to a real terminal — added `-u` to `CMD` for unbuffered output |
+| GitHub API calls failed inside the container | `SSLCertVerificationError: self-signed certificate` — Python correctly refused an untrusted certificate | Container's base image lacked an up-to-date CA bundle; added `apt-get install ca-certificates && update-ca-certificates` to the Dockerfile |
+| Container couldn't reach Ollama on the host | `[Errno -2] Name or service not known` for `host.docker.internal` | `host.docker.internal` didn't auto-resolve in this Docker Desktop/WSL2 configuration; added explicit `extra_hosts: - "host.docker.internal:host-gateway"` |
+| `docker-compose up` never showed the interactive prompt | Container ran (confirmed via `docker ps`), but `input()` never appeared, even with `stdin_open`/`tty` | Switched from `docker-compose up` to `docker-compose run`, built specifically for one-off interactive commands |
+
+### Verified end to end
+
+Once all six were fixed, a full run against `psf/requests` from inside the container matched the native (non-Docker) results exactly: 10 issues fetched, the oversized issue (#7357) correctly rejected by the input guardrail, and the remaining 9 categorized with the same quality draft responses seen throughout this README — now running in a portable, reproducible container instead of directly on the host machine.
+
+---
+
 ## Evaluation
 
 Rather than eyeballing outputs, this agent has an automated evaluation harness that measures categorization accuracy against a human-labeled test set.
@@ -664,6 +727,9 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ├── category_breakdown.png    # generated chart, committed so it renders in this README
 ├── mlflow.db                 # MLflow SQLite tracking backend (gitignored)
 ├── triage_checkpoints.db     # SQLite checkpoint store (gitignored)
+├── Dockerfile                # container image definition
+├── docker-compose.yml        # container orchestration + host Ollama networking
+├── requirements.txt          # pinned dependencies for reproducible builds
 └── README.md
 ```
 
@@ -699,3 +765,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Prompt injection has no structural fix equivalent to SQL injection's parameterized queries — delimiters help but don't guarantee safety. Testing a real injection attempt showed structured output (category) fully resisted via the output guardrail, while free-text output (draft response) partially leaked, confirming that structured fields are inherently easier to defend than free text, and that the agent's read-only, human-in-the-loop design covers exactly that remaining gap
 - Reducing LLM calls per unit of work is the single biggest lever for cutting both cost and latency together — combining categorization and drafting into one structured-output call cut LLM calls in half. More importantly, having the Week 9 eval harness already in place meant this optimization could be *verified* safe (identical 90% accuracy, identical failure case, identical per-category metrics) instead of shipped on faith
 - LangGraph's tracing integrates with LangSmith through environment variables alone — no explicit tracing code needed for automatic instrumentation of every node and LLM call. The resulting trace tree exposed real per-step latency data (confirming structured-output parsing takes under 0.01s, so all latency is LLM generation time) that print statements never could have shown
+- Real Docker deployment surfaces problems no tutorial does: a flaky WSL2 network layer, Python's stdout buffering inside containers, missing CA certificates breaking outbound HTTPS, container-to-host networking not resolving by default, and `docker-compose up` vs `run` behaving differently for interactive scripts. Each had a specific, learnable fix rather than a vague workaround — and Docker's layer caching (confirmed directly in build output: 4 of 6 build steps showed `CACHED` after only changing application code) made iterating on these fixes fast once the Dockerfile was structured correctly
