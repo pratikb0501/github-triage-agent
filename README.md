@@ -19,6 +19,7 @@ The agent never posts anything back to GitHub. It produces a report for a human 
 - [Cost & latency optimization](#cost--latency-optimization)
 - [Observability — tracing with LangSmith](#observability--tracing-with-langsmith)
 - [Deployment — Docker](#deployment--docker)
+- [Dataset versioning with DVC](#dataset-versioning-with-dvc)
 - [Evaluation](#evaluation)
   - Per-category precision, recall, F1
   - LLM-as-judge with self-preference bias mitigation
@@ -456,6 +457,49 @@ Once all six were fixed, a full run against `psf/requests` from inside the conta
 
 ---
 
+## Dataset versioning with DVC
+
+`test_set.json` — the human-labeled ground truth eval.py runs against — is versioned with **DVC** rather than tracked directly in git. Git isn't designed for datasets; DVC stores a small pointer file (a content hash) in git while the actual data lives in a separate cache, giving datasets the same version history as code without bloating the repository.
+
+### How it works
+
+```bash
+dvc add test_set.json     # DVC starts tracking the file, creates test_set.json.dvc
+git add test_set.json.dvc # only the tiny pointer file goes into git
+git commit -m "..."
+```
+
+The pointer file itself:
+
+```yaml
+outs:
+- md5: e9d7286e89d3e0c00b342fcd5a2e2c21
+  size: 1321
+  hash: md5
+  path: test_set.json
+```
+
+Because this hash is a fingerprint of the file's exact contents, modifying `test_set.json` produces a different hash — DVC treats it as a new, distinct version, tracked in its own commit.
+
+### Verified: recovering an exact prior version
+
+To prove this actually works, an 11th issue was added to the test set, versioned with DVC (hash changed from `e9d7286e...` to `7db84a29...`, size 1321 → 1410 bytes), then reverted using git + DVC together:
+
+```bash
+git checkout <old-commit> -- test_set.json.dvc   # restore the OLD pointer
+dvc checkout test_set.json.dvc                    # fetch the data matching that pointer
+```
+
+The result was the exact original 10-issue file, byte-for-byte — the added issue gone, nothing else changed.
+
+### Why this matters beyond the demo
+
+Because DVC's pointer files are ordinary git objects, code and data versioning are genuinely independent — any commit of `agent.py` can be paired with any version of `test_set.json`, including combinations that never existed together in a single commit. This is what makes it possible to isolate whether an accuracy change came from a code change or a dataset change: hold the data constant (checkout the old `.dvc` pointer, `dvc checkout`) and re-run the *current* code against it. If the score returns to the old baseline, the dataset was the cause, not the code — the same "change one variable, hold the other constant" method used throughout this project's evaluation work.
+
+At 10 entries, `test_set.json` doesn't strictly need DVC's remote-storage capability to function — git alone could handle a file this small. The value here is demonstrating the workflow and discipline, which is identical regardless of dataset size, and becomes necessary rather than optional once a real corpus grows past what git can reasonably track.
+
+---
+
 ## Evaluation
 
 Rather than eyeballing outputs, this agent has an automated evaluation harness that measures categorization accuracy against a human-labeled test set.
@@ -721,7 +765,9 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 ├── eval.py                   # categorization accuracy harness + regression testing + MLflow logging
 ├── judge_eval.py             # LLM-as-judge for draft response quality
 ├── dashboard.py               # renders eval_history.json as trend + category charts
-├── test_set.json             # human-labeled ground truth (10 issues)
+├── test_set.json             # human-labeled ground truth (10 issues), versioned with DVC
+├── test_set.json.dvc         # DVC pointer file (hash + size), tracked by git
+├── .dvc/                     # DVC config and local data cache (gitignored)
 ├── eval_history.json         # timestamped score history for regression detection
 ├── accuracy_trend.png        # generated chart, committed so it renders in this README
 ├── category_breakdown.png    # generated chart, committed so it renders in this README
@@ -766,3 +812,4 @@ Works on any public repo. Tested against `psf/requests` (146 open issues at time
 - Reducing LLM calls per unit of work is the single biggest lever for cutting both cost and latency together — combining categorization and drafting into one structured-output call cut LLM calls in half. More importantly, having the Week 9 eval harness already in place meant this optimization could be *verified* safe (identical 90% accuracy, identical failure case, identical per-category metrics) instead of shipped on faith
 - LangGraph's tracing integrates with LangSmith through environment variables alone — no explicit tracing code needed for automatic instrumentation of every node and LLM call. The resulting trace tree exposed real per-step latency data (confirming structured-output parsing takes under 0.01s, so all latency is LLM generation time) that print statements never could have shown
 - Real Docker deployment surfaces problems no tutorial does: a flaky WSL2 network layer, Python's stdout buffering inside containers, missing CA certificates breaking outbound HTTPS, container-to-host networking not resolving by default, and `docker-compose up` vs `run` behaving differently for interactive scripts. Each had a specific, learnable fix rather than a vague workaround — and Docker's layer caching (confirmed directly in build output: 4 of 6 build steps showed `CACHED` after only changing application code) made iterating on these fixes fast once the Dockerfile was structured correctly
+- DVC versions datasets the way git versions code, without bloating the repository — a small content-hashed pointer file goes into git, the actual data lives in a separate cache. Verified this directly: modified the test set, watched the hash change, then reverted using git + DVC together and recovered the exact original file. Because code and data are versioned independently, any commit of the code can be paired with any version of the dataset — which is what makes it possible to isolate whether an accuracy change came from a code change or a data change, holding one constant while varying the other
